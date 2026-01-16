@@ -7,7 +7,8 @@
     // ============================================
     L.TileLayer.Batch = L.TileLayer.extend({
         options: {
-            batchDelay: 300,
+            batchDelay: 150,           // Base delay for zoom >= 0
+            batchDelayNegative: 400,   // Longer delay for negative zoom (composite tiles)
             maxBatchSize: 2000,
             batchEndpoint: '/api/tiles/batch'
         },
@@ -20,10 +21,74 @@
             this._worldName = 'world';
             this._isSending = false;
             this._queuedWhileSending = new Map();
+            this._currentZoom = 0;
+            this._abortController = null;
+            this._isZooming = false;
+            this._zoomEndTimer = null;
         },
 
         setWorld: function(worldName) {
             this._worldName = worldName;
+        },
+
+        // Called when layer is added to map
+        onAdd: function(map) {
+            L.TileLayer.prototype.onAdd.call(this, map);
+
+            // Listen for zoom events to cancel obsolete requests
+            map.on('zoomstart', this._onZoomStart, this);
+            map.on('zoomend', this._onZoomEnd, this);
+        },
+
+        onRemove: function(map) {
+            map.off('zoomstart', this._onZoomStart, this);
+            map.off('zoomend', this._onZoomEnd, this);
+            this._cancelAllRequests();
+            L.TileLayer.prototype.onRemove.call(this, map);
+        },
+
+        _onZoomStart: function() {
+            this._isZooming = true;
+            // Cancel pending batches during zoom - they'll be obsolete
+            if (this._batchTimer) {
+                clearTimeout(this._batchTimer);
+                this._batchTimer = null;
+            }
+        },
+
+        _onZoomEnd: function() {
+            // Small delay after zoom ends to let tiles settle
+            if (this._zoomEndTimer) clearTimeout(this._zoomEndTimer);
+            this._zoomEndTimer = setTimeout(() => {
+                this._isZooming = false;
+                // Now start collecting and sending tiles
+                if (this._pendingTiles.size > 0) {
+                    const delay = this._getBatchDelay();
+                    this._batchTimer = setTimeout(() => this._sendBatch(), delay);
+                }
+            }, 100);
+        },
+
+        _cancelAllRequests: function() {
+            // Abort in-flight requests
+            if (this._abortController) {
+                this._abortController.abort();
+                this._abortController = null;
+            }
+            // Clear pending tiles
+            this._pendingTiles.clear();
+            this._queuedWhileSending.clear();
+            if (this._batchTimer) {
+                clearTimeout(this._batchTimer);
+                this._batchTimer = null;
+            }
+            this._isSending = false;
+        },
+
+        _getBatchDelay: function() {
+            // Use longer delay for negative zoom levels (composite tiles are expensive)
+            const zoom = this._map ? Math.floor(this._map.getZoom()) : 0;
+            return zoom < 0 ? this.options.batchDelayNegative : this.options.batchDelay;
         },
 
         createTile: function(coords, done) {
@@ -33,7 +98,7 @@
 
             // Use actual zoom level for tile pyramid support
             // At zoom < 0, server provides composite tiles
-            const zoom = Math.min(coords.z, 0);  // Clamp to 0 max (server handles -4 to 0)
+            const zoom = Math.min(coords.z, 0);  // Clamp to 0 max (server handles -3 to 0)
             const key = `${zoom}/${coords.x}/${coords.y}`;
             this._queueTileRequest(key, coords, tile, done);
 
@@ -50,6 +115,9 @@
                 coords: coords
             });
 
+            // Don't schedule batches while zooming
+            if (this._isZooming) return;
+
             if (this._batchTimer) {
                 clearTimeout(this._batchTimer);
             }
@@ -58,17 +126,24 @@
             if (!this._isSending && this._pendingTiles.size >= this.options.maxBatchSize) {
                 this._sendBatch();
             } else if (!this._isSending) {
-                this._batchTimer = setTimeout(() => this._sendBatch(), this.options.batchDelay);
+                const delay = this._getBatchDelay();
+                this._batchTimer = setTimeout(() => this._sendBatch(), delay);
             }
         },
 
         _sendBatch: function() {
             if (this._pendingTiles.size === 0) return;
+            // Don't send while zooming
+            if (this._isZooming) return;
 
             this._isSending = true;
             const allTiles = new Map(this._pendingTiles);
             this._pendingTiles.clear();
             this._batchTimer = null;
+
+            // Create AbortController for this batch
+            this._abortController = new AbortController();
+            const signal = this._abortController.signal;
 
             // Split into chunks of 200 tiles max
             const CHUNK_SIZE = 200;
@@ -89,23 +164,25 @@
             console.log(`Sending ${allTiles.size} tiles in ${chunks.length} batch(es)`);
 
             // Send all chunks in parallel
-            const chunkPromises = chunks.map(chunk => this._sendChunk(chunk));
+            const chunkPromises = chunks.map(chunk => this._sendChunk(chunk, signal));
 
             Promise.all(chunkPromises).finally(() => {
+                this._abortController = null;
                 this._isSending = false;
                 // Process any tiles that were queued while we were sending
-                if (this._queuedWhileSending.size > 0) {
+                if (this._queuedWhileSending.size > 0 && !this._isZooming) {
                     for (const [key, value] of this._queuedWhileSending) {
                         this._pendingTiles.set(key, value);
                     }
                     this._queuedWhileSending.clear();
-                    // Schedule next batch
-                    this._batchTimer = setTimeout(() => this._sendBatch(), this.options.batchDelay);
+                    // Schedule next batch with appropriate delay
+                    const delay = this._getBatchDelay();
+                    this._batchTimer = setTimeout(() => this._sendBatch(), delay);
                 }
             });
         },
 
-        _sendChunk: function(batch) {
+        _sendChunk: function(batch, signal) {
             const tiles = [];
             for (const [key, request] of batch) {
                 const [z, x, y] = key.split('/').map(Number);
@@ -120,7 +197,8 @@
             return fetch(this.options.batchEndpoint, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(requestBody)
+                body: JSON.stringify(requestBody),
+                signal: signal
             })
             .then(response => {
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -155,8 +233,12 @@
                 }
             })
             .catch(error => {
-                console.error('Batch chunk failed:', error);
+                // Don't log abort errors - they're intentional
+                if (error.name !== 'AbortError') {
+                    console.error('Batch chunk failed:', error);
+                }
                 for (const [key, request] of batch) {
+                    // For aborted requests, just mark as failed silently
                     request.done(error, request.tile);
                 }
             });
@@ -235,17 +317,19 @@
         }
 
         // Batch tile layer - reduces HTTP requests by batching multiple tiles per request
-        // minNativeZoom: -4 means server provides composite tiles at negative zoom levels
-        // This dramatically reduces DOM elements at zoomed-out views
+        // minNativeZoom: -3 means server provides composite tiles at negative zoom levels
+        // Using -3 instead of -4 reduces base tiles per composite from 256 to 64 (4x faster)
+        // Users can still zoom out to -4, tiles will be scaled from -3
         tileLayer = L.tileLayer.batch('/api/tiles/' + currentWorld + '/{z}/{x}/{y}.png', {
             tileSize: TILE_SIZE,
-            minNativeZoom: -4,  // Server provides tiles from -4 to 0
+            minNativeZoom: -3,  // Server provides tiles from -3 to 0 (64 base tiles max)
             maxNativeZoom: 0,   // Max native zoom is 0 (single chunk per tile)
-            minZoom: -4,
+            minZoom: -4,        // User can still zoom out to -4 (scaled from -3)
             maxZoom: 4,
             noWrap: true,
             bounds: [[-100000, -100000], [100000, 100000]],
-            batchDelay: 300,
+            batchDelay: 150,            // Fast batching at zoom >= 0
+            batchDelayNegative: 400,    // Slower batching at negative zoom (composite tiles)
             maxBatchSize: 2000,
             batchEndpoint: '/api/tiles/batch'
         });

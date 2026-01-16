@@ -52,6 +52,12 @@ public class CompositeTileGenerator {
         int baseChunkX = tileX * chunksPerAxis;
         int baseChunkZ = tileZ * chunksPerAxis;
 
+        // Early bail-out: if no chunks in this area are explored, return empty tile immediately
+        // This saves fetching 64+ base tiles for unexplored areas
+        if (!this.tileManager.hasAnyExploredChunks(worldName, baseChunkX, baseChunkZ, chunksPerAxis)) {
+            return CompletableFuture.completedFuture(PngEncoder.encodeEmpty(tileSize));
+        }
+
         // Fetch all base tiles with pixels in parallel
         List<CompletableFuture<TileWithPosition>> futures = new ArrayList<>();
         for (int dz = 0; dz < chunksPerAxis; dz++) {

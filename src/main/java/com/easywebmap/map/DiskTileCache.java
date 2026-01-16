@@ -20,7 +20,8 @@ public class DiskTileCache {
     public DiskTileCache(Path dataDirectory) {
         this.cacheDirectory = dataDirectory.resolve("tilecache");
         this.tileTimestamps = new ConcurrentHashMap<>();
-        this.diskExecutor = Executors.newFixedThreadPool(2, r -> {
+        // Increased from 2 to 6 threads for faster parallel disk reads during composite tile generation
+        this.diskExecutor = Executors.newFixedThreadPool(6, r -> {
             Thread t = new Thread(r, "EasyWebMap-DiskIO");
             t.setDaemon(true);
             return t;

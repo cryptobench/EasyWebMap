@@ -24,9 +24,12 @@ public class TileManager {
     private final ConcurrentHashMap<String, CachedChunkIndexes> chunkIndexCache;
     private final ConcurrentHashMap<String, PngEncoder.TileData> pixelCache;
     private CompositeTileGenerator compositeTileGenerator;
-    private static final int MAX_PIXEL_CACHE = 512;
+    // Increased from 512 to 2048 to prevent cache thrashing at negative zoom levels
+    // (A single zoom -4 tile requires 256 base tile pixels)
+    private static final int MAX_PIXEL_CACHE = 2048;
     // Limit concurrent tile generations to prevent CPU spikes
-    private static final int MAX_CONCURRENT_GENERATIONS = 4;
+    // Increased from 4 to 16 for faster composite tile generation at negative zoom levels
+    private static final int MAX_CONCURRENT_GENERATIONS = 16;
     private final Semaphore generationSemaphore = new Semaphore(MAX_CONCURRENT_GENERATIONS);
     // Empty tiles are ~270 bytes, real tiles are 10KB+
     private static final int EMPTY_TILE_THRESHOLD = 500;
@@ -178,6 +181,7 @@ public class TileManager {
      */
     public CompletableFuture<PngEncoder.TileData> getBaseTileWithPixels(String worldName, int tileX, int tileZ) {
         String cacheKey = TileCache.createKey(worldName, 0, tileX, tileZ);
+        int tileSize = this.plugin.getConfig().getTileSize();
 
         // 1. Check pixel cache
         PngEncoder.TileData cached = this.pixelCache.get(cacheKey);
@@ -191,7 +195,27 @@ public class TileManager {
             return pending;
         }
 
-        // 3. Generate with pixels
+        // 3. Check disk cache and decode PNG to pixels (faster than regenerating)
+        if (this.plugin.getConfig().isUseDiskCache()) {
+            byte[] diskCached = this.diskCache.get(worldName, 0, tileX, tileZ);
+            if (diskCached != null && diskCached.length > EMPTY_TILE_THRESHOLD) {
+                try {
+                    int[] pixels = PngDecoder.decode(diskCached, tileSize);
+                    if (pixels != null) {
+                        PngEncoder.TileData tileData = new PngEncoder.TileData(diskCached, pixels, tileSize);
+                        // Cache the pixels for future compositing
+                        if (this.pixelCache.size() < MAX_PIXEL_CACHE) {
+                            this.pixelCache.put(cacheKey, tileData);
+                        }
+                        return CompletableFuture.completedFuture(tileData);
+                    }
+                } catch (Exception e) {
+                    // Failed to decode, will regenerate
+                }
+            }
+        }
+
+        // 4. Generate with pixels
         CompletableFuture<PngEncoder.TileData> future = this.generateTileWithPixels(worldName, tileX, tileZ);
         this.pendingPixelRequests.put(cacheKey, future);
         future.whenComplete((data, ex) -> {
@@ -354,6 +378,58 @@ public class TileManager {
         } catch (Exception e) {
             // If we can't check, allow rendering (fail open for usability)
             return true;
+        }
+    }
+
+    /**
+     * Check if any chunks in the given area are explored.
+     * Used for early bail-out on composite tiles over unexplored areas.
+     */
+    public boolean hasAnyExploredChunks(String worldName, int baseChunkX, int baseChunkZ, int chunksPerAxis) {
+        if (!this.plugin.getConfig().isRenderExploredChunksOnly()) {
+            return true; // If we're not filtering, assume there's content
+        }
+
+        World world = Universe.get().getWorld(worldName);
+        if (world == null) {
+            return false;
+        }
+
+        try {
+            LongSet indexes = this.getCachedChunkIndexes(world);
+            if (indexes == null) {
+                return true; // Fail open
+            }
+
+            // Quick sampling - check corners and center first
+            int[][] samplePoints = {
+                {0, 0}, // top-left
+                {chunksPerAxis - 1, 0}, // top-right
+                {0, chunksPerAxis - 1}, // bottom-left
+                {chunksPerAxis - 1, chunksPerAxis - 1}, // bottom-right
+                {chunksPerAxis / 2, chunksPerAxis / 2} // center
+            };
+
+            for (int[] point : samplePoints) {
+                long idx = ChunkUtil.indexChunk(baseChunkX + point[0], baseChunkZ + point[1]);
+                if (indexes.contains(idx)) {
+                    return true;
+                }
+            }
+
+            // If samples show nothing, do a full scan (but this is rare)
+            for (int dz = 0; dz < chunksPerAxis; dz++) {
+                for (int dx = 0; dx < chunksPerAxis; dx++) {
+                    long idx = ChunkUtil.indexChunk(baseChunkX + dx, baseChunkZ + dz);
+                    if (indexes.contains(idx)) {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        } catch (Exception e) {
+            return true; // Fail open
         }
     }
 
