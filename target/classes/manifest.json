@@ -1,9 +1,0 @@
-{
-    "Group": "cryptobench",
-    "Name": "EasyWebMap",
-    "Version": "1.0.0",
-    "Main": "com.easywebmap.EasyWebMap",
-    "Description": "Live web map viewer for Hytale",
-    "Authors": [],
-    "Dependencies": {}
-}
