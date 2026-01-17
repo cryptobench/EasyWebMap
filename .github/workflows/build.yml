@@ -40,19 +40,19 @@ jobs:
       contents: write
 
     steps:
-      - name: Download artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: EasyWebMap
-          path: .
-
-      - name: List downloaded files
-        run: ls -la
-
       - name: Checkout for commit info
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: EasyWebMap
+          path: ./artifacts
+
+      - name: List downloaded files
+        run: ls -la ./artifacts
 
       - name: Generate version
         id: version
@@ -68,8 +68,7 @@ jobs:
 
       - name: Rename JAR
         run: |
-          # Find the JAR wherever it is
-          JAR_FILE=$(find . -name "EasyWebMap-*.jar" -type f | head -1)
+          JAR_FILE=$(find ./artifacts -name "EasyWebMap-*.jar" -type f | head -1)
           echo "Found JAR: $JAR_FILE"
           mv "$JAR_FILE" EasyWebMap-${{ steps.version.outputs.version }}.jar
 
