@@ -275,21 +275,15 @@
 
     function initMap() {
         // Using CRS.Simple: 1 unit = 1 pixel at zoom 0
-        // We want 1 unit = 1 block, so we need to scale tiles
-        // Set large bounds to allow zooming out
-        const worldBounds = L.latLngBounds(
-            L.latLng(-100000, -100000),
-            L.latLng(100000, 100000)
-        );
-
+        // No maxBounds set - allow unlimited panning
+        // Bounds will only affect tile loading, not map navigation
         map = L.map('map', {
             crs: L.CRS.Simple,
             minZoom: -4,
             maxZoom: 4,
             zoomSnap: 0.5,
-            zoomDelta: 0.5,
-            maxBounds: worldBounds,
-            maxBoundsViscosity: 1.0
+            zoomDelta: 0.5
+            // No maxBounds - unlimited panning allowed
         });
 
         // Start at origin
@@ -320,6 +314,7 @@
         // minNativeZoom: -3 means server provides composite tiles at negative zoom levels
         // Using -3 instead of -4 reduces base tiles per composite from 256 to 64 (4x faster)
         // Users can still zoom out to -4, tiles will be scaled from -3
+        // No bounds set on tile layer - tiles load for any coordinate
         tileLayer = L.tileLayer.batch('/api/tiles/' + currentWorld + '/{z}/{x}/{y}.png', {
             tileSize: TILE_SIZE,
             minNativeZoom: -3,  // Server provides tiles from -3 to 0 (64 base tiles max)
@@ -327,7 +322,7 @@
             minZoom: -4,        // User can still zoom out to -4 (scaled from -3)
             maxZoom: 4,
             noWrap: true,
-            bounds: [[-100000, -100000], [100000, 100000]],
+            // No bounds - tiles load for any coordinate
             batchDelay: 150,            // Fast batching at zoom >= 0
             batchDelayNegative: 400,    // Slower batching at negative zoom (composite tiles)
             maxBatchSize: 2000,
