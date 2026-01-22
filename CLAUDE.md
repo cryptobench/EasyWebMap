@@ -133,6 +133,160 @@ getTaskRegistry()            // For scheduled tasks
 getDataDirectory()           // Plugin data folder: mods/Group_PluginName/
 ```
 
+## CRITICAL: Multi-Threaded Architecture & Thread Safety
+
+**Hytale uses a multi-threaded server model. Understanding this is MANDATORY before writing any plugin code.**
+
+### Core Architecture
+
+| Component | Description |
+|-----------|-------------|
+| **HytaleServer** | Singleton root; owns `SCHEDULED_EXECUTOR` for background tasks |
+| **Universe** | Singleton container for all worlds; thread-safe player lookups via `ConcurrentHashMap` |
+| **World** | Each world runs on its **own dedicated thread** |
+
+**Key Benefit:** Lag in "World A" does NOT cause lag in "World B" - worlds run in parallel.
+
+### The Thread-Bound Rule (CRITICAL)
+
+**The `EntityStore` and ALL ECS operations (`getComponent`, `addComponent`, `removeComponent`) are THREAD-BOUND.**
+
+They can ONLY be accessed from their specific world's thread. Hytale uses `assertThread()` internally - accessing from the wrong thread throws `IllegalStateException` immediately to prevent silent data corruption.
+
+```java
+// WRONG - will crash if called from wrong thread
+store.getComponent(playerRef, Player.getComponentType());
+
+// CORRECT - ensures execution on world thread
+world.execute(() -> {
+    store.getComponent(playerRef, Player.getComponentType());
+});
+```
+
+### The Bridge: `world.execute()`
+
+To run code on a specific world's thread from an external thread (background task, different world, etc.), use `world.execute()`:
+
+```java
+// From a background task or different thread
+world.execute(() -> {
+    // This code runs safely on the world's thread
+    Store<EntityStore> store = world.getEntityStore().getStore();
+    // Now safe to access ECS components
+});
+```
+
+### Thread-Safe vs Thread-Bound Operations
+
+| Always Safe (Any Thread) | Unsafe (Requires `world.execute()`) |
+|-------------------------|-------------------------------------|
+| `Universe.get().getPlayer(uuid)` | `store.getComponent(ref, type)` |
+| `playerRef.sendMessage(message)` | `store.addComponent(...)` |
+| `HytaleServer.SCHEDULED_EXECUTOR.schedule(...)` | `store.removeComponent(...)` |
+| `world.execute(runnable)` | Modifying entity position/health/inventory |
+
+### Managing Shared Plugin State
+
+When sharing data across multiple worlds (global state), use Java's thread-safe types:
+
+```java
+// Counters - use AtomicInteger
+private final AtomicInteger globalKills = new AtomicInteger(0);
+globalKills.incrementAndGet();
+
+// Collections/Maps - use ConcurrentHashMap
+private final ConcurrentHashMap<UUID, Integer> playerKills = new ConcurrentHashMap<>();
+playerKills.merge(playerId, 1, Integer::sum);
+
+// One-time initialization - use AtomicBoolean
+private final AtomicBoolean initialized = new AtomicBoolean(false);
+if (initialized.compareAndSet(false, true)) {
+    // Initialize only once
+}
+
+// Simple flags - use volatile
+private volatile boolean enabled = true;
+```
+
+### Common Mistakes & Patterns
+
+#### The Executor Trap
+`SCHEDULED_EXECUTOR` runs on its own background thread, NOT a world thread:
+```java
+// WRONG - crashes when touching entity
+HytaleServer.SCHEDULED_EXECUTOR.schedule(() -> {
+    store.getComponent(ref, type);  // IllegalStateException!
+}, 1, TimeUnit.SECONDS);
+
+// CORRECT - bridge back to world thread
+HytaleServer.SCHEDULED_EXECUTOR.schedule(() -> {
+    world.execute(() -> {
+        store.getComponent(ref, type);  // Safe!
+    });
+}, 1, TimeUnit.SECONDS);
+```
+
+#### Avoid Blocking World Threads
+Never call `.join()` or `.get()` on a `CompletableFuture` inside a world thread - it blocks the entire world tick:
+```java
+// WRONG - blocks world tick
+CompletableFuture<Data> future = fetchDataAsync();
+Data data = future.get();  // DON'T DO THIS
+
+// CORRECT - use callbacks
+fetchDataAsync().thenAccept(data -> {
+    world.execute(() -> {
+        // Process data on world thread
+    });
+});
+```
+
+#### Race Conditions
+Remember that `counter++` is secretly three operations (read, increment, write):
+```java
+// WRONG - race condition
+private int counter = 0;
+counter++;  // Lost updates!
+
+// CORRECT - atomic operation
+private final AtomicInteger counter = new AtomicInteger(0);
+counter.incrementAndGet();
+```
+
+### Technical Specifications
+
+| Spec | Value | Notes |
+|------|-------|-------|
+| **Tick Rate** | 30 TPS | 33.3ms per tick (vs Minecraft's 20 TPS) |
+| **Tick Budget** | 33ms | Heavy logic (>33ms) lags the entire world |
+| **Scaling** | Per-core | More CPU cores = more parallel worlds |
+
+### Performance Best Practices
+
+1. **Offload Heavy Work:** Move expensive operations (pathfinding, database I/O, HTTP requests) to `SCHEDULED_EXECUTOR` or `CompletableFuture.runAsync()`
+2. **Avoid Object Creation in Ticks:** Reuse objects where possible to reduce GC pressure
+3. **Use `world.execute()` Sparingly:** Queue minimal work back to world threads
+
+### Local vs Global Events
+
+| Event Type | Thread Context | Example |
+|------------|---------------|---------|
+| **Local Events** | Fires on the World Thread | `PlayerInteractEvent`, `BreakBlockEvent` - safe to touch ECS directly |
+| **Global Events** | May fire on different thread | Server-wide events - must use `world.execute()` before touching entities |
+
+### The Golden Rule
+
+> **"Always assume you are on the wrong thread unless you are inside a standard World System or event handler. If you touch `store`, verify you are thread-bound or wrapped in `world.execute()`."**
+
+### Debugging Thread Issues
+
+If you see:
+- `IllegalStateException: Assert not in thread!` → You're accessing ECS from wrong thread
+- `IllegalStateException: Store is currently processing!` → You're modifying during iteration
+- Random crashes or data corruption → Race condition, use atomic types
+
+**First debug step:** "Is this code touching a Store/Component while running on an Executor thread?"
+
 ## EasyMap-Specific APIs
 
 ### Tile Generation Flow
