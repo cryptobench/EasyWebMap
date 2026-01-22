@@ -16,6 +16,8 @@ public class DiskTileCache {
     private final Path cacheDirectory;
     private final ConcurrentHashMap<String, Long> tileTimestamps;
     private final ExecutorService diskExecutor;
+    // Limit timestamp cache to prevent unbounded memory growth
+    private static final int MAX_TIMESTAMP_CACHE = 10000;
 
     public DiskTileCache(Path dataDirectory) {
         this.cacheDirectory = dataDirectory.resolve("tilecache");
@@ -60,7 +62,7 @@ public class DiskTileCache {
      */
     public void putAsync(String worldName, int zoom, int x, int z, byte[] data) {
         String key = createKey(worldName, zoom, x, z);
-        this.tileTimestamps.put(key, System.currentTimeMillis());
+        this.addTimestamp(key, System.currentTimeMillis());
         this.diskExecutor.execute(() -> putSync(worldName, zoom, x, z, data));
     }
 
@@ -70,7 +72,24 @@ public class DiskTileCache {
     public void put(String worldName, int zoom, int x, int z, byte[] data) {
         putSync(worldName, zoom, x, z, data);
         String key = createKey(worldName, zoom, x, z);
-        this.tileTimestamps.put(key, System.currentTimeMillis());
+        this.addTimestamp(key, System.currentTimeMillis());
+    }
+
+    /**
+     * Adds a timestamp with size limit enforcement to prevent memory leaks.
+     */
+    private void addTimestamp(String key, long timestamp) {
+        this.tileTimestamps.put(key, timestamp);
+        // Evict oldest entries if over capacity
+        if (this.tileTimestamps.size() > MAX_TIMESTAMP_CACHE) {
+            // Remove ~10% of oldest entries
+            int toRemove = MAX_TIMESTAMP_CACHE / 10;
+            this.tileTimestamps.entrySet().stream()
+                .sorted(java.util.Map.Entry.comparingByValue())
+                .limit(toRemove)
+                .map(java.util.Map.Entry::getKey)
+                .forEach(this.tileTimestamps::remove);
+        }
     }
 
     private void putSync(String worldName, int zoom, int x, int z, byte[] data) {
@@ -99,7 +118,7 @@ public class DiskTileCache {
         try {
             BasicFileAttributes attrs = Files.readAttributes(tilePath, BasicFileAttributes.class);
             long fileTime = attrs.lastModifiedTime().toMillis();
-            this.tileTimestamps.put(key, fileTime);
+            this.addTimestamp(key, fileTime);
             return System.currentTimeMillis() - fileTime;
         } catch (IOException e) {
             return Long.MAX_VALUE;

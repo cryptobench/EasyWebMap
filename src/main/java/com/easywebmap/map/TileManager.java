@@ -7,12 +7,10 @@ import com.hypixel.hytale.server.core.universe.world.World;
 import com.hypixel.hytale.server.core.universe.world.storage.ChunkStore;
 import com.hypixel.hytale.server.core.universe.world.storage.IChunkLoader;
 import com.hypixel.hytale.server.core.universe.world.worldmap.WorldMapManager;
-import com.hypixel.hytale.server.core.universe.PlayerRef;
-import com.hypixel.hytale.math.vector.Transform;
-import com.hypixel.hytale.math.vector.Vector3d;
 import it.unimi.dsi.fastutil.longs.LongSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.Semaphore;
 
 public class TileManager {
@@ -23,6 +21,7 @@ public class TileManager {
     private final ConcurrentHashMap<String, CompletableFuture<PngEncoder.TileData>> pendingPixelRequests;
     private final ConcurrentHashMap<String, CachedChunkIndexes> chunkIndexCache;
     private final ConcurrentHashMap<String, PngEncoder.TileData> pixelCache;
+    private final ConcurrentLinkedDeque<String> pixelCacheOrder;  // LRU tracking for pixelCache
     private CompositeTileGenerator compositeTileGenerator;
     // Increased from 512 to 2048 to prevent cache thrashing at negative zoom levels
     // (A single zoom -4 tile requires 256 base tile pixels)
@@ -42,6 +41,7 @@ public class TileManager {
         this.pendingPixelRequests = new ConcurrentHashMap<>();
         this.chunkIndexCache = new ConcurrentHashMap<>();
         this.pixelCache = new ConcurrentHashMap<>();
+        this.pixelCacheOrder = new ConcurrentLinkedDeque<>();
         this.compositeTileGenerator = new CompositeTileGenerator(plugin, this);
     }
 
@@ -186,6 +186,9 @@ public class TileManager {
         // 1. Check pixel cache
         PngEncoder.TileData cached = this.pixelCache.get(cacheKey);
         if (cached != null) {
+            // Update LRU order
+            this.pixelCacheOrder.remove(cacheKey);
+            this.pixelCacheOrder.addLast(cacheKey);
             return CompletableFuture.completedFuture(cached);
         }
 
@@ -203,10 +206,8 @@ public class TileManager {
                     int[] pixels = PngDecoder.decode(diskCached, tileSize);
                     if (pixels != null) {
                         PngEncoder.TileData tileData = new PngEncoder.TileData(diskCached, pixels, tileSize);
-                        // Cache the pixels for future compositing
-                        if (this.pixelCache.size() < MAX_PIXEL_CACHE) {
-                            this.pixelCache.put(cacheKey, tileData);
-                        }
+                        // Cache the pixels for future compositing with LRU eviction
+                        this.addToPixelCache(cacheKey, tileData);
                         return CompletableFuture.completedFuture(tileData);
                     }
                 } catch (Exception e) {
@@ -222,10 +223,8 @@ public class TileManager {
             this.pendingPixelRequests.remove(cacheKey);
             // Don't cache empty tiles - they should regenerate when chunk gets explored
             if (data != null && !data.isEmpty() && data.pngBytes.length > EMPTY_TILE_THRESHOLD && ex == null) {
-                // Cache pixels for compositing, evict if too many
-                if (this.pixelCache.size() < MAX_PIXEL_CACHE) {
-                    this.pixelCache.put(cacheKey, data);
-                }
+                // Cache pixels for compositing with LRU eviction
+                this.addToPixelCache(cacheKey, data);
                 // Also cache PNG bytes
                 this.memoryCache.put(cacheKey, data.pngBytes);
                 if (this.plugin.getConfig().isUseDiskCache()) {
@@ -276,58 +275,27 @@ public class TileManager {
                 .whenComplete((result, ex) -> this.generationSemaphore.release());
     }
 
+    /**
+     * Thread-safe check if any players are near a chunk.
+     * Uses cached player positions from PlayerTracker (updated on world threads).
+     */
     private boolean arePlayersNearby(World world, int tileX, int tileZ) {
         int radius = this.plugin.getConfig().getTileRefreshRadius();
-
-        for (PlayerRef playerRef : world.getPlayerRefs()) {
-            try {
-                Transform transform = playerRef.getTransform();
-                if (transform == null) continue;
-
-                Vector3d pos = transform.getPosition();
-                int playerChunkX = ChunkUtil.chunkCoordinate((int) pos.x);
-                int playerChunkZ = ChunkUtil.chunkCoordinate((int) pos.z);
-
-                int dx = Math.abs(playerChunkX - tileX);
-                int dz = Math.abs(playerChunkZ - tileZ);
-
-                if (dx <= radius && dz <= radius) {
-                    return true;
-                }
-            } catch (Exception e) {
-                // Skip this player
-            }
-        }
-        return false;
+        // Use thread-safe cached player positions instead of accessing ECS directly
+        return this.plugin.getPlayerTracker().isPlayerNearChunk(world.getName(), tileX, tileZ, radius);
     }
 
     /**
-     * Check if any players are within the area covered by a composite tile.
+     * Thread-safe check if any players are within a tile area.
+     * Uses cached player positions from PlayerTracker (updated on world threads).
      */
     private boolean arePlayersInArea(World world, int baseChunkX, int baseChunkZ, int chunksPerAxis) {
         int radius = this.plugin.getConfig().getTileRefreshRadius();
-
-        for (PlayerRef playerRef : world.getPlayerRefs()) {
-            try {
-                Transform transform = playerRef.getTransform();
-                if (transform == null) continue;
-
-                Vector3d pos = transform.getPosition();
-                int playerChunkX = ChunkUtil.chunkCoordinate((int) pos.x);
-                int playerChunkZ = ChunkUtil.chunkCoordinate((int) pos.z);
-
-                // Check if player is within the area (with buffer for refresh radius)
-                if (playerChunkX >= baseChunkX - radius &&
-                    playerChunkX < baseChunkX + chunksPerAxis + radius &&
-                    playerChunkZ >= baseChunkZ - radius &&
-                    playerChunkZ < baseChunkZ + chunksPerAxis + radius) {
-                    return true;
-                }
-            } catch (Exception e) {
-                // Skip this player
-            }
-        }
-        return false;
+        int maxChunkX = baseChunkX + chunksPerAxis - 1;
+        int maxChunkZ = baseChunkZ + chunksPerAxis - 1;
+        // Use thread-safe cached player positions instead of accessing ECS directly
+        return this.plugin.getPlayerTracker().isPlayerInArea(
+            world.getName(), baseChunkX, baseChunkZ, maxChunkX, maxChunkZ, radius);
     }
 
     private CompletableFuture<byte[]> generateTile(String worldName, int zoom, int tileX, int tileZ) {
@@ -433,6 +401,13 @@ public class TileManager {
         }
     }
 
+    /**
+     * Gets cached chunk indexes for a world.
+     * Note: loader.getIndexes() reads chunk metadata (which chunks exist on disk),
+     * not ECS entity data. This is considered safe from any thread as it's
+     * read-only metadata access, not component data access.
+     * Results are cached to minimize calls.
+     */
     private LongSet getCachedChunkIndexes(World world) {
         String worldName = world.getName();
         CachedChunkIndexes cached = this.chunkIndexCache.get(worldName);
@@ -442,7 +417,7 @@ public class TileManager {
             return cached.indexes;
         }
 
-        // Refresh the cache
+        // Refresh the cache - reads chunk metadata, not ECS components
         try {
             ChunkStore chunkStore = world.getChunkStore();
             IChunkLoader loader = chunkStore.getLoader();
@@ -500,6 +475,7 @@ public class TileManager {
     public void clearCache() {
         this.memoryCache.clear();
         this.pixelCache.clear();
+        this.pixelCacheOrder.clear();
         this.diskCache.clear();
         this.chunkIndexCache.clear();
     }
@@ -507,10 +483,66 @@ public class TileManager {
     public void clearMemoryCache() {
         this.memoryCache.clear();
         this.pixelCache.clear();
+        this.pixelCacheOrder.clear();
+    }
+
+    /**
+     * Adds to pixel cache with LRU eviction to prevent unbounded growth.
+     */
+    private void addToPixelCache(String key, PngEncoder.TileData data) {
+        if (this.pixelCache.putIfAbsent(key, data) == null) {
+            this.pixelCacheOrder.addLast(key);
+            // Evict oldest entries if over capacity
+            while (this.pixelCache.size() > MAX_PIXEL_CACHE) {
+                String oldest = this.pixelCacheOrder.pollFirst();
+                if (oldest != null) {
+                    this.pixelCache.remove(oldest);
+                } else {
+                    break;
+                }
+            }
+        }
     }
 
     public void shutdown() {
         this.diskCache.shutdown();
+    }
+
+    /**
+     * Cleans up caches for worlds that no longer exist.
+     * Should be called periodically to prevent memory leaks from unloaded worlds.
+     */
+    public void cleanupStaleWorldCaches() {
+        java.util.Set<String> activeWorlds = new java.util.HashSet<>();
+        for (World world : Universe.get().getWorlds().values()) {
+            activeWorlds.add(world.getName());
+        }
+
+        // Clean chunkIndexCache
+        this.chunkIndexCache.keySet().removeIf(worldName -> !activeWorlds.contains(worldName));
+
+        // Clean pixelCache entries for removed worlds
+        this.pixelCache.keySet().removeIf(key -> {
+            String worldName = key.split("/")[0];
+            return !activeWorlds.contains(worldName);
+        });
+
+        // Clean memoryCache entries for removed worlds
+        // Note: TileCache doesn't expose keys, so we rely on LRU eviction
+    }
+
+    /**
+     * Clears all caches for a specific world.
+     */
+    public void clearWorldCaches(String worldName) {
+        this.chunkIndexCache.remove(worldName);
+
+        // Remove pixel cache entries for this world
+        this.pixelCache.keySet().removeIf(key -> key.startsWith(worldName + "/"));
+        this.pixelCacheOrder.removeIf(key -> key.startsWith(worldName + "/"));
+
+        // Clear disk cache for this world
+        this.diskCache.clearWorld(worldName);
     }
 
     public int getMemoryCacheSize() {
