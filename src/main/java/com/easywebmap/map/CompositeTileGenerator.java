@@ -123,8 +123,10 @@ public class CompositeTileGenerator {
             return PngEncoder.encodeEmpty(outputSize);
         }
 
-        // Use RGB (no alpha) - faster encoding
-        BufferedImage composite = new BufferedImage(outputSize, outputSize, BufferedImage.TYPE_INT_RGB);
+        // ARGB: present sub-tiles are opaque, missing/unexplored sub-chunks stay
+        // at 0 (fully transparent) instead of opaque black — so composite gaps
+        // show the map background seamlessly rather than black blocks.
+        BufferedImage composite = new BufferedImage(outputSize, outputSize, BufferedImage.TYPE_INT_ARGB);
         composite.setRGB(0, 0, outputSize, outputSize, compositePixels, 0, outputSize);
 
         return encodeFast(composite, outputSize);

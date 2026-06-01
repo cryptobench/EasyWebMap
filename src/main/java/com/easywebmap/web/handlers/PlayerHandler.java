@@ -3,9 +3,9 @@ package com.easywebmap.web.handlers;
 import com.easywebmap.EasyWebMap;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.hypixel.hytale.math.vector.Rotation3f;
 import com.hypixel.hytale.math.vector.Transform;
-import com.hypixel.hytale.math.vector.Vector3d;
-import com.hypixel.hytale.math.vector.Vector3f;
+import org.joml.Vector3d;
 import com.hypixel.hytale.server.core.universe.PlayerRef;
 import com.hypixel.hytale.server.core.universe.Universe;
 import com.hypixel.hytale.server.core.universe.world.World;
@@ -82,14 +82,14 @@ public class PlayerHandler {
                 Transform transform = playerRef.getTransform();
                 if (transform != null) {
                     Vector3d pos = transform.getPosition();
-                    Vector3f rot = transform.getRotation();
+                    Rotation3f rot = transform.getRotation();
                     Map<String, Object> playerData = new HashMap<>();
                     playerData.put("name", playerRef.getUsername());
                     playerData.put("uuid", playerRef.getUuid().toString());
                     playerData.put("x", pos.x);
                     playerData.put("y", pos.y);
                     playerData.put("z", pos.z);
-                    playerData.put("yaw", rot != null ? rot.y : 0f);
+                    playerData.put("yaw", rot != null ? rot.yaw() : 0f);
                     players.add(playerData);
                 }
             } catch (Exception e) {

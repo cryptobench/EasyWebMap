@@ -9,8 +9,8 @@ import com.hypixel.hytale.server.core.universe.world.storage.IChunkLoader;
 import com.hypixel.hytale.server.core.universe.world.worldmap.WorldMapManager;
 import com.hypixel.hytale.server.core.universe.PlayerRef;
 import com.hypixel.hytale.math.vector.Transform;
-import com.hypixel.hytale.math.vector.Vector3d;
-import it.unimi.dsi.fastutil.longs.LongSet;
+import org.joml.Vector3d;
+import it.unimi.dsi.fastutil.longs.LongCollection;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
@@ -77,7 +77,9 @@ public class TileManager {
         // 3. Check disk cache
         if (this.plugin.getConfig().isUseDiskCache()) {
             byte[] diskCached = this.diskCache.get(worldName, zoom, tileX, tileZ);
-            if (diskCached != null) {
+            // Skip stale empty/black placeholders (e.g. cached before a fix) so
+            // they fall through to regeneration instead of being served forever.
+            if (diskCached != null && !PngEncoder.isEmptyTile(diskCached, this.plugin.getConfig().getTileSize())) {
                 long tileAge = this.diskCache.getTileAge(worldName, zoom, tileX, tileZ);
                 // Use longer refresh interval for composite tiles (they're more expensive)
                 long refreshInterval = this.plugin.getConfig().getTileRefreshIntervalMs() * 2;
@@ -105,7 +107,7 @@ public class TileManager {
         this.pendingRequests.put(cacheKey, future);
         future.whenComplete((data, ex) -> {
             this.pendingRequests.remove(cacheKey);
-            if (data != null && data.length > EMPTY_TILE_THRESHOLD && ex == null) {
+            if (data != null && ex == null && !PngEncoder.isEmptyTile(data, this.plugin.getConfig().getTileSize())) {
                 this.memoryCache.put(cacheKey, data);
                 if (this.plugin.getConfig().isUseDiskCache()) {
                     this.diskCache.putAsync(worldName, zoom, tileX, tileZ, data);
@@ -137,7 +139,8 @@ public class TileManager {
         // 3. Check disk cache if enabled
         if (this.plugin.getConfig().isUseDiskCache()) {
             byte[] diskCached = this.diskCache.get(worldName, 0, tileX, tileZ);
-            if (diskCached != null) {
+            // Skip stale empty/black placeholders so they regenerate (self-heal).
+            if (diskCached != null && !PngEncoder.isEmptyTile(diskCached, this.plugin.getConfig().getTileSize())) {
                 long tileAge = this.diskCache.getTileAge(worldName, 0, tileX, tileZ);
                 long refreshInterval = this.plugin.getConfig().getTileRefreshIntervalMs();
 
@@ -165,7 +168,7 @@ public class TileManager {
         future.whenComplete((data, ex) -> {
             this.pendingRequests.remove(cacheKey);
             // Don't cache empty tiles - they should regenerate when chunk gets explored
-            if (data != null && data.length > EMPTY_TILE_THRESHOLD && ex == null) {
+            if (data != null && ex == null && !PngEncoder.isEmptyTile(data, this.plugin.getConfig().getTileSize())) {
                 this.memoryCache.put(cacheKey, data);
                 if (this.plugin.getConfig().isUseDiskCache()) {
                     this.diskCache.putAsync(worldName, 0, tileX, tileZ, data);
@@ -198,7 +201,7 @@ public class TileManager {
         // 3. Check disk cache and decode PNG to pixels (faster than regenerating)
         if (this.plugin.getConfig().isUseDiskCache()) {
             byte[] diskCached = this.diskCache.get(worldName, 0, tileX, tileZ);
-            if (diskCached != null && diskCached.length > EMPTY_TILE_THRESHOLD) {
+            if (diskCached != null && !PngEncoder.isEmptyTile(diskCached, tileSize)) {
                 try {
                     int[] pixels = PngDecoder.decode(diskCached, tileSize);
                     if (pixels != null) {
@@ -221,7 +224,7 @@ public class TileManager {
         future.whenComplete((data, ex) -> {
             this.pendingPixelRequests.remove(cacheKey);
             // Don't cache empty tiles - they should regenerate when chunk gets explored
-            if (data != null && !data.isEmpty() && data.pngBytes.length > EMPTY_TILE_THRESHOLD && ex == null) {
+            if (data != null && ex == null && !data.isEmpty()) {
                 // Cache pixels for compositing, evict if too many
                 if (this.pixelCache.size() < MAX_PIXEL_CACHE) {
                     this.pixelCache.put(cacheKey, data);
@@ -369,7 +372,7 @@ public class TileManager {
 
     private boolean isChunkExplored(World world, int chunkX, int chunkZ) {
         try {
-            LongSet indexes = this.getCachedChunkIndexes(world);
+            LongCollection indexes = this.getCachedChunkIndexes(world);
             if (indexes == null) {
                 return true; // Fail open if we can't get indexes
             }
@@ -396,7 +399,7 @@ public class TileManager {
         }
 
         try {
-            LongSet indexes = this.getCachedChunkIndexes(world);
+            LongCollection indexes = this.getCachedChunkIndexes(world);
             if (indexes == null) {
                 return true; // Fail open
             }
@@ -433,7 +436,7 @@ public class TileManager {
         }
     }
 
-    private LongSet getCachedChunkIndexes(World world) {
+    private LongCollection getCachedChunkIndexes(World world) {
         String worldName = world.getName();
         CachedChunkIndexes cached = this.chunkIndexCache.get(worldName);
         long now = System.currentTimeMillis();
@@ -449,7 +452,7 @@ public class TileManager {
             if (loader == null) {
                 return null;
             }
-            LongSet indexes = loader.getIndexes();
+            LongCollection indexes = loader.getIndexes();
             this.chunkIndexCache.put(worldName, new CachedChunkIndexes(indexes, now));
             return indexes;
         } catch (Exception e) {
@@ -522,10 +525,10 @@ public class TileManager {
     }
 
     private static class CachedChunkIndexes {
-        final LongSet indexes;
+        final LongCollection indexes;
         final long timestamp;
 
-        CachedChunkIndexes(LongSet indexes, long timestamp) {
+        CachedChunkIndexes(LongCollection indexes, long timestamp) {
             this.indexes = indexes;
             this.timestamp = timestamp;
         }

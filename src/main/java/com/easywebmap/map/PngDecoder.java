@@ -35,7 +35,7 @@ public class PngDecoder {
             // Ensure expected dimensions
             if (width != expectedSize || height != expectedSize) {
                 // Scale if needed (shouldn't normally happen)
-                BufferedImage scaled = new BufferedImage(expectedSize, expectedSize, BufferedImage.TYPE_INT_RGB);
+                BufferedImage scaled = new BufferedImage(expectedSize, expectedSize, BufferedImage.TYPE_INT_ARGB);
                 scaled.getGraphics().drawImage(image, 0, 0, expectedSize, expectedSize, null);
                 image = scaled;
                 width = expectedSize;
